@@ -1,4 +1,6 @@
 import inspect
+import logging
+import os
 import traceback
 from contextlib import redirect_stdout
 from datetime import datetime
@@ -9,7 +11,7 @@ from textwrap import indent
 
 import discord
 from discord import Embed, Color, Activity
-from discord.enums import ActivityType
+from discord.enums import ActivityType, Status
 from discord.ext import commands
 
 from aiohttp import ClientResponseError
@@ -18,8 +20,10 @@ from core import checks
 from core.changelog import Changelog
 from core.decorators import github_access_token_required, trigger_typing
 from core.models import Bot, InvalidConfigError
-from core.paginator import PaginatorSession
-from core.utils import cleanup_code
+from core.paginator import PaginatorSession, MessagePaginatorSession
+from core.utils import cleanup_code, info, error
+
+logger = logging.getLogger('Modmail')
 
 
 class Utility:
@@ -232,12 +236,105 @@ class Utility:
         embed.set_footer(text=footer)
         await ctx.send(embed=embed)
 
+    @commands.group()
+    @commands.is_owner()
+    @trigger_typing
+    async def debug(self, ctx):
+        """Shows the recent logs of the bot."""
+
+        if ctx.invoked_subcommand is not None:
+            return
+
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               '../temp/logs.log'), 'r+') as f:
+            logs = f.read().strip()
+
+        if not logs:
+            embed = Embed(
+                color=self.bot.main_color,
+                title='Debug Logs:',
+                description='You don\'t have any logs at the moment.'
+            )
+            embed.set_footer(text='Go to Heroku to see your logs.')
+            return await ctx.send(embed=embed)
+
+        messages = []
+
+        # Using Scala formatting because it's similar to Python for exceptions
+        # and it does a fine job formatting the logs.
+        msg = '```Scala\n'
+
+        for line in logs.splitlines(keepends=True):
+            if msg != '```Scala\n':
+                if len(line) + len(msg) + 3 > 2000:
+                    msg += '```'
+                    messages.append(msg)
+                    msg = '```Scala\n'
+            msg += line
+            if len(msg) + 3 > 2000:
+                msg = msg[:1993] + '[...]```'
+                messages.append(msg)
+                msg = '```Scala\n'
+
+        if msg != '```Scala\n':
+            msg += '```'
+            messages.append(msg)
+
+        embed = Embed(
+            color=self.bot.main_color
+        )
+        embed.set_footer(text='Debug logs - Navigate using the reactions below.')
+
+        session = MessagePaginatorSession(ctx, *messages, embed=embed)
+        return await session.run()
+
+    @debug.command()
+    @commands.is_owner()
+    @trigger_typing
+    async def hastebin(self, ctx):
+        """Upload logs to hastebin."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               '../temp/logs.log'), 'r+') as f:
+            logs = f.read().strip()
+
+        try:
+            async with self.bot.session.post('https://hasteb.in/documents',
+                                             data=logs) as resp:
+                key = (await resp.json())["key"]
+                embed = Embed(
+                    title='Debug Logs',
+                    color=self.bot.main_color,
+                    description=f'https://hasteb.in/' + key
+                )
+        except (JSONDecodeError, ClientResponseError, IndexError):
+            embed = Embed(
+                title='Debug Logs',
+                color=self.bot.main_color,
+                description='Something\'s wrong. '
+                            'We\'re unable to upload your logs to hastebin.'
+            )
+            embed.set_footer(text='Go to Heroku to see your logs.')
+        await ctx.send(embed=embed)
+
+    @debug.command()
+    @commands.is_owner()
+    @trigger_typing
+    async def clear(self, ctx):
+        """Clears the locally cached logs."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               '../temp/logs.log'), 'w'):
+            pass
+        await ctx.send(embed=Embed(
+            color=self.bot.main_color,
+            description='Cached logs are now cleared.'
+        ))
+
     @commands.command()
     @commands.is_owner()
     @github_access_token_required
     @trigger_typing
     async def github(self, ctx):
-        """Shows the github user your access token is linked to."""
+        """Shows the GitHub user your access token is linked to."""
         if ctx.invoked_subcommand:
             return
 
@@ -313,7 +410,7 @@ class Utility:
 
     @commands.command(aliases=['presence'])
     @checks.has_permissions(administrator=True)
-    async def activity(self, ctx, activity_type: str, *, message: str = ''):
+    async def activity(self, ctx, activity_type: str.lower, *, message: str = ''):
         """
         Set a custom activity for the bot.
 
@@ -330,10 +427,10 @@ class Utility:
         it must be followed by a "to": "listening to..."
         """
         if activity_type == 'clear':
-            await self.bot.change_presence(activity=None)
             self.bot.config['activity_type'] = None
             self.bot.config['activity_message'] = None
             await self.bot.config.update()
+            await self.set_presence()
             embed = Embed(
                 title='Activity Removed',
                 color=self.bot.main_color
@@ -343,42 +440,153 @@ class Utility:
         if not message:
             raise commands.UserInputError
 
-        try:
-            activity_type = ActivityType[activity_type.lower()]
-        except KeyError:
+        activity, msg = (await self.set_presence(
+                activity_identifier=activity_type,
+                activity_by_key=True,
+                activity_message=message
+         ))['activity']
+        if activity is None:
             raise commands.UserInputError
 
-        if activity_type == ActivityType.listening:
-            if not message.lower().startswith('to '):
-                # Must be listening to...
-                raise commands.UserInputError
-            normalized_message = message[3:].strip()
-        else:
-            # Discord does not allow leading/trailing spaces anyways
-            normalized_message = message.strip()
-
-        if activity_type == ActivityType.streaming:
-            url = self.bot.config.get('twitch_url',
-                                      'https://www.twitch.tv/discord-Modmail/')
-        else:
-            url = None
-
-        activity = Activity(type=activity_type,
-                            name=normalized_message,
-                            url=url)
-        await self.bot.change_presence(activity=activity)
-
-        self.bot.config['activity_type'] = activity_type
+        self.bot.config['activity_type'] = activity.type.value
         self.bot.config['activity_message'] = message
         await self.bot.config.update()
 
-        desc = f'Current activity is: {activity_type.name} {message}.'
         embed = Embed(
             title='Activity Changed',
-            description=desc,
+            description=msg,
             color=self.bot.main_color
         )
         return await ctx.send(embed=embed)
+
+    @commands.command()
+    @checks.has_permissions(administrator=True)
+    async def status(self, ctx, *, status_type: str.lower):
+        """
+        Set a custom status for the bot.
+
+        Possible status types:
+            - `online`
+            - `idle`
+            - `dnd`
+            - `do_not_disturb` or `do not disturb`
+            - `invisible` or `offline`
+            - `clear`
+
+        When status type is set to `clear`, the current status is removed.
+        """
+        if status_type == 'clear':
+            self.bot.config['status'] = None
+            await self.bot.config.update()
+            await self.set_presence()
+            embed = Embed(
+                title='Status Removed',
+                color=self.bot.main_color
+            )
+            return await ctx.send(embed=embed)
+        status_type = status_type.replace(' ', '_')
+
+        status, msg = (await self.set_presence(
+                status_identifier=status_type,
+                status_by_key=True
+        ))['status']
+        if status is None:
+            raise commands.UserInputError
+
+        self.bot.config['status'] = status.value
+        await self.bot.config.update()
+
+        embed = Embed(
+            title='Status Changed',
+            description=msg,
+            color=self.bot.main_color
+        )
+        return await ctx.send(embed=embed)
+
+    async def set_presence(self, *,
+                           status_identifier=None,
+                           status_by_key=True,
+                           activity_identifier=None,
+                           activity_by_key=True,
+                           activity_message=None):
+
+        activity = status = None
+        if status_identifier is None:
+            status_identifier = self.bot.config.get('status', None)
+            status_by_key = False
+
+        try:
+            if status_by_key:
+                status = Status[status_identifier]
+            else:
+                status = Status(status_identifier)
+        except (KeyError, ValueError):
+            if status_identifier is not None:
+                msg = f'Invalid status type: {status_identifier}'
+                logger.warning(error(msg))
+
+        if activity_identifier is None:
+            if activity_message is not None:
+                raise ValueError('activity_message must be None '
+                                 'if activity_identifier is None.')
+            activity_identifier = self.bot.config.get('activity_type', None)
+            activity_by_key = False
+
+        try:
+            if activity_by_key:
+                activity_type = ActivityType[activity_identifier]
+            else:
+                activity_type = ActivityType(activity_identifier)
+        except (KeyError, ValueError):
+            if activity_identifier is not None:
+                msg = f'Invalid activity type: {activity_identifier}'
+                logger.warning(error(msg))
+        else:
+            url = None
+            activity_message = (
+                    activity_message or
+                    self.bot.config.get('activity_message', '')
+            ).strip()
+
+            if activity_type == ActivityType.listening:
+                if activity_message.lower().startswith('to '):
+                    # The actual message is after listening to [...]
+                    # discord automatically add the "to"
+                    activity_message = activity_message[3:].strip()
+            elif activity_type == ActivityType.streaming:
+                url = self.bot.config.get(
+                    'twitch_url', 'https://www.twitch.tv/discord-modmail/'
+                )
+
+            if activity_message:
+                activity = Activity(type=activity_type,
+                                    name=activity_message,
+                                    url=url)
+            else:
+                msg = 'You must supply an activity message to use custom activity.'
+                logger.warning(error(msg))
+
+        await self.bot.change_presence(activity=activity, status=status)
+
+        presence = {'activity': (None, 'No activity has been set.'),
+                    'status': (None, 'No status has been set.')}
+        if activity is not None:
+            # TODO: Trim message
+            to = 'to ' if activity.type == ActivityType.listening else ''
+            msg = f'Activity set to: {activity.type.name.capitalize()} '
+            msg += f'{to}{activity.name}.'
+            presence['activity'] = (activity, msg)
+        if status is not None:
+            msg = f'Status set to: {status.value}.'
+            presence['status'] = (status, msg)
+        return presence
+
+    async def on_ready(self):
+        # Wait until config cache is populated with stuff from db
+        await self.bot.config.wait_until_ready()
+        presence = await self.set_presence()
+        logger.info(info(presence['activity'][1]))
+        logger.info(info(presence['status'][1]))
 
     @commands.command()
     @trigger_typing
